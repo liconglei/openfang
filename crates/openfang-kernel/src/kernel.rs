@@ -1742,7 +1742,8 @@ impl OpenFangKernel {
                     None
                 },
                 peer_agents,
-                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                // Use date-only format (no time) to keep system prompt stable for LLM prompt caching
+                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y").to_string()),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2213,7 +2214,8 @@ impl OpenFangKernel {
                     None
                 },
                 peer_agents,
-                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                // Use date-only format (no time) to keep system prompt stable for LLM prompt caching
+                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y").to_string()),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);

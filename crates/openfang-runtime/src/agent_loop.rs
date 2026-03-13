@@ -206,17 +206,21 @@ pub async fn run_agent_loop(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt — base prompt comes from kernel (prompt_builder),
-    // we append recalled memories here since they are resolved at loop time.
-    let mut system_prompt = manifest.model.system_prompt.clone();
-    if !memories.is_empty() {
+    // Use the system prompt as-is from kernel (prompt_builder).
+    // Memories are NOT appended to system prompt to keep it stable for LLM prompt caching.
+    // Instead, memories are injected as a separate user message below.
+    let system_prompt = manifest.model.system_prompt.clone();
+
+    // Build memory section for injection as user message (if any).
+    let memory_msg = if !memories.is_empty() {
         let mem_pairs: Vec<(String, String)> = memories
             .iter()
             .map(|m| (String::new(), m.content.clone()))
             .collect();
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
-    }
+        Some(crate::prompt_builder::build_memory_section(&mem_pairs))
+    } else {
+        None
+    };
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
@@ -249,6 +253,12 @@ pub async fn run_agent_loop(
         if !cc_msg.is_empty() {
             messages.insert(0, Message::user(cc_msg));
         }
+    }
+
+    // Inject recalled memories as a user message (not in system prompt)
+    // to keep the system prompt stable for LLM prompt caching.
+    if let Some(ref mem_msg) = memory_msg {
+        messages.insert(0, Message::user(mem_msg));
     }
 
     let mut total_usage = TokenUsage::default();
