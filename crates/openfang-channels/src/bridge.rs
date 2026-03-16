@@ -430,6 +430,7 @@ fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
         "telegram" => OutputFormat::TelegramHtml,
         "slack" => OutputFormat::SlackMrkdwn,
         "wecom" => OutputFormat::PlainText,
+        "matrix" => OutputFormat::MatrixHtml,
         _ => OutputFormat::Markdown,
     }
 }
@@ -1863,6 +1864,10 @@ mod tests {
         assert_eq!(
             default_output_format_for_channel("discord"),
             OutputFormat::Markdown
+        );
+        assert_eq!(
+            default_output_format_for_channel("matrix"),
+            OutputFormat::MatrixHtml
         );
     }
 

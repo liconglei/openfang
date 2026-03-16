@@ -14,6 +14,7 @@ pub fn format_for_channel(text: &str, format: OutputFormat) -> String {
         OutputFormat::TelegramHtml => markdown_to_telegram_html(text),
         OutputFormat::SlackMrkdwn => markdown_to_slack_mrkdwn(text),
         OutputFormat::PlainText => markdown_to_plain(text),
+        OutputFormat::MatrixHtml => markdown_to_matrix_html(text),
     }
 }
 
@@ -563,6 +564,323 @@ fn markdown_to_plain(text: &str) -> String {
     result
 }
 
+/// Convert Markdown to Matrix HTML format.
+///
+/// Matrix supports a richer HTML subset than Telegram:
+/// - Headings: `<h1>` - `<h6>`
+/// - Lists: `<ul>`, `<ol>`, `<li>`
+/// - Tables: `<table>`, `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>`
+/// - Code: `<code>`, `<pre>`
+/// - Formatting: `<b>`, `<i>`, `<u>`, `<s>`, `<strong>`, `<em>`, `<del>`
+/// - Links: `<a href="">`
+/// - Other: `<blockquote>`, `<details>`, `<summary>`, `<hr>`, `<br>`, `<p>`
+///
+/// See: https://spec.matrix.org/v1.11/client-server-api/#mroommessage-msgtypes
+fn markdown_to_matrix_html(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Horizontal rule
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            blocks.push("<hr>".to_string());
+            i += 1;
+            continue;
+        }
+
+        // Fenced code block
+        if let Some(fence) = fence_delimiter(trimmed) {
+            i += 1;
+            let mut code_lines = Vec::new();
+            while i < lines.len() {
+                let candidate = lines[i].trim();
+                if candidate.starts_with(fence) {
+                    i += 1;
+                    break;
+                }
+                code_lines.push(lines[i]);
+                i += 1;
+            }
+            let code = escape_html(&code_lines.join("\n"));
+            blocks.push(format!("<pre><code>{}</code></pre>", code));
+            continue;
+        }
+
+        // ATX heading (#, ##, ..., ######)
+        if let Some((level, content)) = heading_level_and_text(trimmed) {
+            blocks.push(format!(
+                "<h{level}>{}</h{level}>",
+                render_inline_markdown_matrix(content.trim())
+            ));
+            i += 1;
+            continue;
+        }
+
+        // Table detection
+        if trimmed.starts_with('|') && trimmed.ends_with('|') && i + 1 < lines.len() {
+            let next_line = lines[i + 1].trim();
+            if next_line.starts_with('|') && is_table_divider(next_line) {
+                // Parse table
+                let mut table_rows = Vec::new();
+                let header_line = trimmed;
+                table_rows.push(header_line);
+                i += 2; // Skip header and divider
+                while i < lines.len() {
+                    let row = lines[i].trim();
+                    if row.starts_with('|') && row.ends_with('|') && !is_table_divider(row) {
+                        table_rows.push(row);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                blocks.push(render_table_matrix(&table_rows));
+                continue;
+            }
+        }
+
+        // Blockquote
+        if trimmed.starts_with('>') {
+            let mut quote_lines = Vec::new();
+            while i < lines.len() {
+                let current = lines[i].trim();
+                if current.is_empty() || !current.starts_with('>') {
+                    break;
+                }
+                let content = current.strip_prefix('>').unwrap_or(current).trim_start();
+                quote_lines.push(render_inline_markdown_matrix(content));
+                i += 1;
+            }
+            blocks.push(format!(
+                "<blockquote>{}</blockquote>",
+                quote_lines.join("<br>")
+            ));
+            continue;
+        }
+
+        // Unordered list
+        if let Some(item) = unordered_list_item(trimmed) {
+            let mut items = vec![render_inline_markdown_matrix(item.trim())];
+            i += 1;
+            while i < lines.len() {
+                let current = lines[i].trim();
+                if let Some(next_item) = unordered_list_item(current) {
+                    items.push(render_inline_markdown_matrix(next_item.trim()));
+                    i += 1;
+                } else if current.is_empty() {
+                    i += 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            let li_items: Vec<String> = items.iter().map(|s| format!("<li>{s}</li>")).collect();
+            blocks.push(format!("<ul>{}</ul>", li_items.join("")));
+            continue;
+        }
+
+        // Ordered list
+        if let Some(item) = ordered_list_item(trimmed) {
+            let mut items = vec![render_inline_markdown_matrix(item.trim())];
+            i += 1;
+            while i < lines.len() {
+                let current = lines[i].trim();
+                if let Some(next_item) = ordered_list_item(current) {
+                    items.push(render_inline_markdown_matrix(next_item.trim()));
+                    i += 1;
+                } else if current.is_empty() {
+                    i += 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            let li_items: Vec<String> = items.iter().map(|s| format!("<li>{s}</li>")).collect();
+            blocks.push(format!("<ol>{}</ol>", li_items.join("")));
+            continue;
+        }
+
+        // Paragraph
+        let mut paragraph_lines = vec![trimmed];
+        i += 1;
+        while i < lines.len() {
+            let current = lines[i].trim();
+            if current.is_empty()
+                || fence_delimiter(current).is_some()
+                || heading_level_and_text(current).is_some()
+                || current.starts_with('>')
+                || unordered_list_item(current).is_some()
+                || ordered_list_item(current).is_some()
+                || current == "---"
+                || current == "***"
+                || current == "___"
+            {
+                break;
+            }
+            paragraph_lines.push(current);
+            i += 1;
+        }
+        let joined = paragraph_lines.join("<br>");
+        blocks.push(format!("<p>{}</p>", render_inline_markdown_matrix(&joined)));
+    }
+
+    blocks.join("\n")
+}
+
+/// Extract heading level (1-6) and content from an ATX heading line.
+fn heading_level_and_text(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    if line.chars().nth(hashes) != Some(' ') {
+        return None;
+    }
+    Some((hashes, &line[hashes + 1..]))
+}
+
+/// Render inline markdown for Matrix (supports more tags than Telegram).
+fn render_inline_markdown_matrix(text: &str) -> String {
+    let mut result = escape_html(text);
+
+    // Strikethrough: ~~text~~ → <del>text</del>
+    while let Some(start) = result.find("~~") {
+        if let Some(end_rel) = result[start + 2..].find("~~") {
+            let end = start + 2 + end_rel;
+            let inner = result[start + 2..end].to_string();
+            result = format!("{}<del>{}</del>{}", &result[..start], inner, &result[end + 2..]);
+        } else {
+            break;
+        }
+    }
+
+    // Bold: **text** → <strong>text</strong>
+    while let Some(start) = result.find("**") {
+        if let Some(end_rel) = result[start + 2..].find("**") {
+            let end = start + 2 + end_rel;
+            let inner = result[start + 2..end].to_string();
+            result = format!("{}<strong>{}</strong>{}", &result[..start], inner, &result[end + 2..]);
+        } else {
+            break;
+        }
+    }
+
+    // Links: [text](url) → <a href="url">text</a>
+    while let Some(bracket_start) = result.find('[') {
+        if let Some(bracket_end_rel) = result[bracket_start..].find("](") {
+            let bracket_end = bracket_start + bracket_end_rel;
+            if let Some(paren_end_rel) = result[bracket_end + 2..].find(')') {
+                let paren_end = bracket_end + 2 + paren_end_rel;
+                let link_text = result[bracket_start + 1..bracket_end].to_string();
+                let url = result[bracket_end + 2..paren_end].to_string();
+                result = format!(
+                    "{}<a href=\"{}\">{}</a>{}",
+                    &result[..bracket_start],
+                    url,
+                    link_text,
+                    &result[paren_end + 1..]
+                );
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Inline code: `text` → <code>text</code>
+    while let Some(start) = result.find('`') {
+        if let Some(end_rel) = result[start + 1..].find('`') {
+            let end = start + 1 + end_rel;
+            let inner = result[start + 1..end].to_string();
+            result = format!(
+                "{}<code>{}</code>{}",
+                &result[..start],
+                inner,
+                &result[end + 1..]
+            );
+        } else {
+            break;
+        }
+    }
+
+    // Italic: *text* → <em>text</em> (single star only)
+    let mut out = String::with_capacity(result.len());
+    let chars: Vec<char> = result.chars().collect();
+    let mut i = 0;
+    let mut in_italic = false;
+    while i < chars.len() {
+        if chars[i] == '*'
+            && (i == 0 || chars[i - 1] != '*')
+            && (i + 1 >= chars.len() || chars[i + 1] != '*')
+        {
+            if in_italic {
+                out.push_str("</em>");
+            } else {
+                out.push_str("<em>");
+            }
+            in_italic = !in_italic;
+        } else {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+
+    out
+}
+
+/// Render a Markdown table as Matrix HTML table.
+fn render_table_matrix(rows: &[&str]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut html = String::from("<table>");
+
+    // First row is header
+    let headers: Vec<&str> = rows[0]
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim())
+        .collect();
+    html.push_str("<thead><tr>");
+    for header in &headers {
+        html.push_str(&format!("<th>{}</th>", render_inline_markdown_matrix(header)));
+    }
+    html.push_str("</tr></thead>");
+
+    // Remaining rows are body
+    if rows.len() > 1 {
+        html.push_str("<tbody>");
+        for row in &rows[1..] {
+            let cells: Vec<&str> = row
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim())
+                .collect();
+            html.push_str("<tr>");
+            for cell in &cells {
+                html.push_str(&format!("<td>{}</td>", render_inline_markdown_matrix(cell)));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</tbody>");
+    }
+
+    html.push_str("</table>");
+    html
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +989,97 @@ mod tests {
             result,
             "Title\n\nquoted text\n\ndone item\ntodo item\n\nlet value = 1;\n\ndocs (https://example.com)"
         );
+    }
+
+    // Matrix HTML tests
+    #[test]
+    fn test_matrix_html_bold() {
+        let result = markdown_to_matrix_html("Hello **world**!");
+        assert_eq!(result, "<p>Hello <strong>world</strong>!</p>");
+    }
+
+    #[test]
+    fn test_matrix_html_italic() {
+        let result = markdown_to_matrix_html("Hello *world*!");
+        assert_eq!(result, "<p>Hello <em>world</em>!</p>");
+    }
+
+    #[test]
+    fn test_matrix_html_strikethrough() {
+        let result = markdown_to_matrix_html("This is ~~deleted~~ text");
+        assert_eq!(result, "<p>This is <del>deleted</del> text</p>");
+    }
+
+    #[test]
+    fn test_matrix_html_code() {
+        let result = markdown_to_matrix_html("Use `println!`");
+        assert_eq!(result, "<p>Use <code>println!</code></p>");
+    }
+
+    #[test]
+    fn test_matrix_html_link() {
+        let result = markdown_to_matrix_html("[click here](https://example.com)");
+        assert_eq!(result, "<p><a href=\"https://example.com\">click here</a></p>");
+    }
+
+    #[test]
+    fn test_matrix_html_heading() {
+        let result = markdown_to_matrix_html("## Result");
+        assert_eq!(result, "<h2>Result</h2>");
+    }
+
+    #[test]
+    fn test_matrix_html_heading_levels() {
+        assert_eq!(markdown_to_matrix_html("# H1"), "<h1>H1</h1>");
+        assert_eq!(markdown_to_matrix_html("## H2"), "<h2>H2</h2>");
+        assert_eq!(markdown_to_matrix_html("### H3"), "<h3>H3</h3>");
+        assert_eq!(markdown_to_matrix_html("###### H6"), "<h6>H6</h6>");
+    }
+
+    #[test]
+    fn test_matrix_html_unordered_list() {
+        let result = markdown_to_matrix_html("- alpha\n- beta");
+        assert_eq!(result, "<ul><li>alpha</li><li>beta</li></ul>");
+    }
+
+    #[test]
+    fn test_matrix_html_ordered_list() {
+        let result = markdown_to_matrix_html("1. alpha\n2. beta");
+        assert_eq!(result, "<ol><li>alpha</li><li>beta</li></ol>");
+    }
+
+    #[test]
+    fn test_matrix_html_fenced_code_block() {
+        let result = markdown_to_matrix_html("```rust\nfn main() {}\n```");
+        assert_eq!(result, "<pre><code>fn main() {}</code></pre>");
+    }
+
+    #[test]
+    fn test_matrix_html_blockquote() {
+        let result = markdown_to_matrix_html("> note\n> second line");
+        assert_eq!(result, "<blockquote>note<br>second line</blockquote>");
+    }
+
+    #[test]
+    fn test_matrix_html_horizontal_rule() {
+        let result = markdown_to_matrix_html("before\n\n---\n\nafter");
+        assert_eq!(result, "<p>before</p>\n<hr>\n<p>after</p>");
+    }
+
+    #[test]
+    fn test_matrix_html_table() {
+        let result = markdown_to_matrix_html("| Name | Value |\n|------|-------|\n| A | 1 |\n| B | 2 |");
+        assert!(result.contains("<table>"));
+        assert!(result.contains("<thead>"));
+        assert!(result.contains("<th>Name</th>"));
+        assert!(result.contains("<tbody>"));
+        assert!(result.contains("<td>A</td>"));
+    }
+
+    #[test]
+    fn test_format_matrix_html() {
+        let text = "**bold** and *italic*";
+        let result = format_for_channel(text, OutputFormat::MatrixHtml);
+        assert_eq!(result, "<p><strong>bold</strong> and <em>italic</em></p>");
     }
 }

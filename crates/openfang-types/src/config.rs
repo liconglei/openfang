@@ -65,6 +65,8 @@ pub enum OutputFormat {
     SlackMrkdwn,
     /// Plain text (no formatting).
     PlainText,
+    /// Matrix HTML format (rich text via org.matrix.custom.html).
+    MatrixHtml,
 }
 
 /// Per-channel behavior overrides.

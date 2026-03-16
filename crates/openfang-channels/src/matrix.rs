@@ -98,6 +98,70 @@ impl MatrixAdapter {
         Ok(())
     }
 
+    /// Send an HTML-formatted message to a Matrix room.
+    ///
+    /// Matrix supports rich text via `org.matrix.custom.html` format.
+    /// The `plain_text` fallback is shown on clients that don't support HTML.
+    async fn api_send_html_message(
+        &self,
+        room_id: &str,
+        plain_text: &str,
+        html: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver_url, room_id, txn_id
+        );
+
+        // Generate plain text fallback by stripping HTML tags
+        let fallback = if plain_text.is_empty() {
+            strip_html_tags(html)
+        } else {
+            plain_text.to_string()
+        };
+
+        let chunks = crate::types::split_message(&fallback, MAX_MESSAGE_LEN);
+        let html_chunks: Vec<&str> = if html.len() > MAX_MESSAGE_LEN * 2 {
+            // For very long HTML, just send the plain text
+            vec![]
+        } else {
+            vec![html]
+        };
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let body = if i == 0 && !html_chunks.is_empty() {
+                serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": chunk,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html,
+                })
+            } else {
+                serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": chunk,
+                })
+            };
+
+            let resp = self
+                .client
+                .put(&url)
+                .bearer_auth(&*self.access_token)
+                .json(&body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Matrix API error {status}: {body}").into());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate credentials by calling /whoami.
     async fn validate(&self) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/_matrix/client/v3/account/whoami", self.homeserver_url);
@@ -412,7 +476,15 @@ impl ChannelAdapter for MatrixAdapter {
     ) -> Result<(), Box<dyn std::error::Error>> {
         match content {
             ChannelContent::Text(text) => {
-                self.api_send_message(&user.platform_id, &text).await?;
+                // Detect if the text contains HTML tags (sent from bridge with MatrixHtml format)
+                if contains_html_tags(&text) {
+                    // Extract plain text fallback by stripping tags
+                    let plain = strip_html_tags(&text);
+                    self.api_send_html_message(&user.platform_id, &plain, &text)
+                        .await?;
+                } else {
+                    self.api_send_message(&user.platform_id, &text).await?;
+                }
             }
             _ => {
                 self.api_send_message(&user.platform_id, "(Unsupported content type)")
@@ -444,10 +516,110 @@ impl ChannelAdapter for MatrixAdapter {
         Ok(())
     }
 
+    async fn send_reaction(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        reaction: &crate::types::LifecycleReaction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Matrix uses m.reaction event type for emoji reactions
+        // PUT /_matrix/client/v3/rooms/{roomId}/send/m.reaction/{txnId}
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.reaction/{}",
+            self.homeserver_url, user.platform_id, txn_id
+        );
+
+        let body = serde_json::json!({
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": message_id,
+                "key": reaction.emoji
+            }
+        });
+
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&*self.access_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Log but don't fail — reactions are non-critical
+            tracing::debug!("Matrix reaction failed ({status}): {body}");
+        }
+
+        Ok(())
+    }
+
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
     }
+}
+
+/// Check if text contains HTML tags that should be sent as formatted Matrix message.
+fn contains_html_tags(text: &str) -> bool {
+    // Look for common HTML tags supported by Matrix
+    let html_patterns = [
+        "<b>", "</b>", "<i>", "</i>", "<u>", "</u>", "<strong>", "</strong>",
+        "<em>", "</em>", "<del>", "</del>", "<code>", "</code>", "<pre>", "</pre>",
+        "<a href", "</a>", "<blockquote>", "</blockquote>", "<h1>", "</h1>",
+        "<h2>", "</h2>", "<h3>", "</h3>", "<h4>", "</h4>", "<h5>", "</h5>",
+        "<h6>", "</h6>", "<ul>", "</ul>", "<ol>", "</ol>", "<li>", "</li>",
+        "<table>", "</table>", "<thead>", "</thead>", "<tbody>", "</tbody>",
+        "<tr>", "</tr>", "<th>", "</th>", "<td>", "</td>", "<p>", "</p>",
+        "<br>", "<hr>", "<img", "<details>", "</details>", "<summary>", "</summary>",
+    ];
+    let lower = text.to_lowercase();
+    html_patterns.iter().any(|tag| lower.contains(tag))
+}
+
+/// Strip HTML tags to produce plain text fallback.
+fn strip_html_tags(html: &str) -> String {
+    // Simple approach: remove tags and decode common entities
+    let mut result = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let chars: Vec<char> = html.chars().collect();
+
+    for i in 0..chars.len() {
+        if chars[i] == '<' {
+            in_tag = true;
+        } else if chars[i] == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(chars[i]);
+        }
+    }
+
+    // Decode common HTML entities
+    result = result.replace("&amp;", "&");
+    result = result.replace("&lt;", "<");
+    result = result.replace("&gt;", ">");
+    result = result.replace("&quot;", "\"");
+    result = result.replace("&#39;", "'");
+    result = result.replace("&nbsp;", " ");
+
+    // Collapse multiple whitespace
+    let mut collapsed = String::new();
+    let mut prev_whitespace = false;
+    for c in result.chars() {
+        if c.is_whitespace() {
+            if !prev_whitespace {
+                collapsed.push(c);
+            }
+            prev_whitespace = true;
+        } else {
+            collapsed.push(c);
+            prev_whitespace = false;
+        }
+    }
+
+    collapsed.trim().to_string()
 }
 
 #[cfg(test)]
@@ -483,5 +655,30 @@ mod tests {
             vec![],
         );
         assert!(open.is_allowed_room("!any:matrix.org"));
+    }
+
+    #[test]
+    fn test_contains_html_tags() {
+        assert!(contains_html_tags("<b>bold</b>"));
+        assert!(contains_html_tags("<p>paragraph</p>"));
+        assert!(contains_html_tags("<a href=\"url\">link</a>"));
+        assert!(contains_html_tags("<pre><code>code</code></pre>"));
+        assert!(contains_html_tags("<ul><li>item</li></ul>"));
+        assert!(!contains_html_tags("plain text"));
+        assert!(!contains_html_tags("2 < 3 and 4 > 1")); // Not HTML tags
+    }
+
+    #[test]
+    fn test_strip_html_tags() {
+        assert_eq!(strip_html_tags("<b>bold</b>"), "bold");
+        assert_eq!(strip_html_tags("<p>Hello <strong>world</strong>!</p>"), "Hello world!");
+        assert_eq!(strip_html_tags("<a href=\"https://example.com\">link</a>"), "link");
+        // Note: strip_html_tags simply removes tags without adding spacing
+        assert_eq!(
+            strip_html_tags("<ul><li>one</li><li>two</li></ul>"),
+            "onetwo"
+        );
+        assert_eq!(strip_html_tags("&amp; &lt; &gt;"), "& < >");
+        assert_eq!(strip_html_tags("plain text"), "plain text");
     }
 }
