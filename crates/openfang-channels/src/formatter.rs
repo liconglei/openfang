@@ -4,8 +4,10 @@
 //! - Telegram HTML: `**bold**` → `<b>bold</b>`
 //! - Slack mrkdwn: `**bold**` → `*bold*`, `[text](url)` → `<url|text>`
 //! - Plain text: strips all formatting
+//! - Matrix HTML: uses pulldown-cmark for robust CommonMark compliance
 
 use openfang_types::config::OutputFormat;
+use pulldown_cmark::{html, Options, Parser};
 
 /// Format a message for a specific channel output format.
 pub fn format_for_channel(text: &str, format: OutputFormat) -> String {
@@ -564,321 +566,35 @@ fn markdown_to_plain(text: &str) -> String {
     result
 }
 
-/// Convert Markdown to Matrix HTML format.
+/// Convert Markdown to Matrix HTML format using pulldown-cmark.
 ///
-/// Matrix supports a richer HTML subset than Telegram:
+/// Matrix supports a rich HTML subset (CommonMark + extensions):
 /// - Headings: `<h1>` - `<h6>`
 /// - Lists: `<ul>`, `<ol>`, `<li>`
 /// - Tables: `<table>`, `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>`
 /// - Code: `<code>`, `<pre>`
-/// - Formatting: `<b>`, `<i>`, `<u>`, `<s>`, `<strong>`, `<em>`, `<del>`
+/// - Formatting: `<strong>`, `<em>`, `<del>`
 /// - Links: `<a href="">`
-/// - Other: `<blockquote>`, `<details>`, `<summary>`, `<hr>`, `<br>`, `<p>`
+/// - Other: `<blockquote>`, `<hr>`, `<br>`, `<p>`
 ///
 /// See: https://spec.matrix.org/v1.11/client-server-api/#mroommessage-msgtypes
 fn markdown_to_matrix_html(text: &str) -> String {
+    // Enable CommonMark extensions for better compatibility
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_SMART_PUNCTUATION);
+
+    // Normalize line endings
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut blocks = Vec::new();
-    let lines: Vec<&str> = normalized.lines().collect();
-    let mut i = 0;
 
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
+    let parser = Parser::new_ext(&normalized, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
 
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Horizontal rule
-        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-            blocks.push("<hr>".to_string());
-            i += 1;
-            continue;
-        }
-
-        // Fenced code block
-        if let Some(fence) = fence_delimiter(trimmed) {
-            i += 1;
-            let mut code_lines = Vec::new();
-            while i < lines.len() {
-                let candidate = lines[i].trim();
-                if candidate.starts_with(fence) {
-                    i += 1;
-                    break;
-                }
-                code_lines.push(lines[i]);
-                i += 1;
-            }
-            let code = escape_html(&code_lines.join("\n"));
-            blocks.push(format!("<pre><code>{}</code></pre>", code));
-            continue;
-        }
-
-        // ATX heading (#, ##, ..., ######)
-        if let Some((level, content)) = heading_level_and_text(trimmed) {
-            blocks.push(format!(
-                "<h{level}>{}</h{level}>",
-                render_inline_markdown_matrix(content.trim())
-            ));
-            i += 1;
-            continue;
-        }
-
-        // Table detection
-        if trimmed.starts_with('|') && trimmed.ends_with('|') && i + 1 < lines.len() {
-            let next_line = lines[i + 1].trim();
-            if next_line.starts_with('|') && is_table_divider(next_line) {
-                // Parse table
-                let mut table_rows = Vec::new();
-                let header_line = trimmed;
-                table_rows.push(header_line);
-                i += 2; // Skip header and divider
-                while i < lines.len() {
-                    let row = lines[i].trim();
-                    if row.starts_with('|') && row.ends_with('|') && !is_table_divider(row) {
-                        table_rows.push(row);
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                blocks.push(render_table_matrix(&table_rows));
-                continue;
-            }
-        }
-
-        // Blockquote
-        if trimmed.starts_with('>') {
-            let mut quote_lines = Vec::new();
-            while i < lines.len() {
-                let current = lines[i].trim();
-                if current.is_empty() || !current.starts_with('>') {
-                    break;
-                }
-                let content = current.strip_prefix('>').unwrap_or(current).trim_start();
-                quote_lines.push(render_inline_markdown_matrix(content));
-                i += 1;
-            }
-            blocks.push(format!(
-                "<blockquote>{}</blockquote>",
-                quote_lines.join("<br>")
-            ));
-            continue;
-        }
-
-        // Unordered list
-        if let Some(item) = unordered_list_item(trimmed) {
-            let mut items = vec![render_inline_markdown_matrix(item.trim())];
-            i += 1;
-            while i < lines.len() {
-                let current = lines[i].trim();
-                if let Some(next_item) = unordered_list_item(current) {
-                    items.push(render_inline_markdown_matrix(next_item.trim()));
-                    i += 1;
-                } else if current.is_empty() {
-                    i += 1;
-                    break;
-                } else {
-                    break;
-                }
-            }
-            let li_items: Vec<String> = items.iter().map(|s| format!("<li>{s}</li>")).collect();
-            blocks.push(format!("<ul>{}</ul>", li_items.join("")));
-            continue;
-        }
-
-        // Ordered list
-        if let Some(item) = ordered_list_item(trimmed) {
-            let mut items = vec![render_inline_markdown_matrix(item.trim())];
-            i += 1;
-            while i < lines.len() {
-                let current = lines[i].trim();
-                if let Some(next_item) = ordered_list_item(current) {
-                    items.push(render_inline_markdown_matrix(next_item.trim()));
-                    i += 1;
-                } else if current.is_empty() {
-                    i += 1;
-                    break;
-                } else {
-                    break;
-                }
-            }
-            let li_items: Vec<String> = items.iter().map(|s| format!("<li>{s}</li>")).collect();
-            blocks.push(format!("<ol>{}</ol>", li_items.join("")));
-            continue;
-        }
-
-        // Paragraph
-        let mut paragraph_lines = vec![trimmed];
-        i += 1;
-        while i < lines.len() {
-            let current = lines[i].trim();
-            if current.is_empty()
-                || fence_delimiter(current).is_some()
-                || heading_level_and_text(current).is_some()
-                || current.starts_with('>')
-                || unordered_list_item(current).is_some()
-                || ordered_list_item(current).is_some()
-                || current == "---"
-                || current == "***"
-                || current == "___"
-            {
-                break;
-            }
-            paragraph_lines.push(current);
-            i += 1;
-        }
-        let joined = paragraph_lines.join("<br>");
-        blocks.push(format!("<p>{}</p>", render_inline_markdown_matrix(&joined)));
-    }
-
-    blocks.join("\n")
-}
-
-/// Extract heading level (1-6) and content from an ATX heading line.
-fn heading_level_and_text(line: &str) -> Option<(usize, &str)> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    if line.chars().nth(hashes) != Some(' ') {
-        return None;
-    }
-    Some((hashes, &line[hashes + 1..]))
-}
-
-/// Render inline markdown for Matrix (supports more tags than Telegram).
-fn render_inline_markdown_matrix(text: &str) -> String {
-    let mut result = escape_html(text);
-
-    // Strikethrough: ~~text~~ → <del>text</del>
-    while let Some(start) = result.find("~~") {
-        if let Some(end_rel) = result[start + 2..].find("~~") {
-            let end = start + 2 + end_rel;
-            let inner = result[start + 2..end].to_string();
-            result = format!("{}<del>{}</del>{}", &result[..start], inner, &result[end + 2..]);
-        } else {
-            break;
-        }
-    }
-
-    // Bold: **text** → <strong>text</strong>
-    while let Some(start) = result.find("**") {
-        if let Some(end_rel) = result[start + 2..].find("**") {
-            let end = start + 2 + end_rel;
-            let inner = result[start + 2..end].to_string();
-            result = format!("{}<strong>{}</strong>{}", &result[..start], inner, &result[end + 2..]);
-        } else {
-            break;
-        }
-    }
-
-    // Links: [text](url) → <a href="url">text</a>
-    while let Some(bracket_start) = result.find('[') {
-        if let Some(bracket_end_rel) = result[bracket_start..].find("](") {
-            let bracket_end = bracket_start + bracket_end_rel;
-            if let Some(paren_end_rel) = result[bracket_end + 2..].find(')') {
-                let paren_end = bracket_end + 2 + paren_end_rel;
-                let link_text = result[bracket_start + 1..bracket_end].to_string();
-                let url = result[bracket_end + 2..paren_end].to_string();
-                result = format!(
-                    "{}<a href=\"{}\">{}</a>{}",
-                    &result[..bracket_start],
-                    url,
-                    link_text,
-                    &result[paren_end + 1..]
-                );
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    // Inline code: `text` → <code>text</code>
-    while let Some(start) = result.find('`') {
-        if let Some(end_rel) = result[start + 1..].find('`') {
-            let end = start + 1 + end_rel;
-            let inner = result[start + 1..end].to_string();
-            result = format!(
-                "{}<code>{}</code>{}",
-                &result[..start],
-                inner,
-                &result[end + 1..]
-            );
-        } else {
-            break;
-        }
-    }
-
-    // Italic: *text* → <em>text</em> (single star only)
-    let mut out = String::with_capacity(result.len());
-    let chars: Vec<char> = result.chars().collect();
-    let mut i = 0;
-    let mut in_italic = false;
-    while i < chars.len() {
-        if chars[i] == '*'
-            && (i == 0 || chars[i - 1] != '*')
-            && (i + 1 >= chars.len() || chars[i + 1] != '*')
-        {
-            if in_italic {
-                out.push_str("</em>");
-            } else {
-                out.push_str("<em>");
-            }
-            in_italic = !in_italic;
-        } else {
-            out.push(chars[i]);
-        }
-        i += 1;
-    }
-
-    out
-}
-
-/// Render a Markdown table as Matrix HTML table.
-fn render_table_matrix(rows: &[&str]) -> String {
-    if rows.is_empty() {
-        return String::new();
-    }
-
-    let mut html = String::from("<table>");
-
-    // First row is header
-    let headers: Vec<&str> = rows[0]
-        .trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim())
-        .collect();
-    html.push_str("<thead><tr>");
-    for header in &headers {
-        html.push_str(&format!("<th>{}</th>", render_inline_markdown_matrix(header)));
-    }
-    html.push_str("</tr></thead>");
-
-    // Remaining rows are body
-    if rows.len() > 1 {
-        html.push_str("<tbody>");
-        for row in &rows[1..] {
-            let cells: Vec<&str> = row
-                .trim_matches('|')
-                .split('|')
-                .map(|cell| cell.trim())
-                .collect();
-            html.push_str("<tr>");
-            for cell in &cells {
-                html.push_str(&format!("<td>{}</td>", render_inline_markdown_matrix(cell)));
-            }
-            html.push_str("</tr>");
-        }
-        html.push_str("</tbody>");
-    }
-
-    html.push_str("</table>");
-    html
+    // pulldown-cmark outputs complete HTML, trim trailing whitespace
+    html_output.trim().to_string()
 }
 
 #[cfg(test)]

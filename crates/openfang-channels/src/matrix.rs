@@ -3,10 +3,13 @@
 //! Uses the Matrix Client-Server API (via reqwest) for sending and receiving messages.
 //! Implements /sync long-polling for real-time message reception.
 
-use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser};
+use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser, OutputFormat};
+use crate::formatter;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
+use openfang_runtime::llm_driver::StreamEvent;
+use serde_json;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,6 +20,21 @@ use zeroize::Zeroizing;
 
 const SYNC_TIMEOUT_MS: u64 = 30000;
 const MAX_MESSAGE_LEN: usize = 4096;
+
+// Streaming constants
+const EDIT_INTERVAL_MS: u64 = 500;
+const MIN_EDIT_CHARS: usize = 50;
+const MAX_PREVIEW_LINES: usize = 3;
+const MAX_INPUT_CHARS: usize = 128;
+const MAX_OUTPUT_CHARS: usize = 256;
+
+// Tool call formatting (Chinese labels)
+const TOOL_CALLS_HEADER: &str = "🔧 工具调用";
+const INPUT_LABEL: &str = "📥 输入";
+const OUTPUT_LABEL: &str = "✅ 输出";
+const ERROR_LABEL: &str = "❌ 错误";
+const NO_PARAMS: &str = "(无参数)";
+const INDENT_PREFIX: &str = "　　";
 
 /// Matrix channel adapter using the Client-Server API.
 pub struct MatrixAdapter {
@@ -62,19 +80,23 @@ impl MatrixAdapter {
     }
 
     /// Send a text message to a Matrix room.
+    /// Returns the event_id of the sent message.
     async fn api_send_message(
         &self,
         room_id: &str,
         text: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let txn_id = uuid::Uuid::new_v4().to_string();
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            self.homeserver_url, room_id, txn_id
-        );
-
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let chunks = crate::types::split_message(text, MAX_MESSAGE_LEN);
+        let mut last_event_id = String::new();
+
         for chunk in chunks {
+            // Each chunk needs a unique transaction ID
+            let txn_id = uuid::Uuid::new_v4().to_string();
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                self.homeserver_url, room_id, txn_id
+            );
+
             let body = serde_json::json!({
                 "msgtype": "m.text",
                 "body": chunk,
@@ -93,27 +115,26 @@ impl MatrixAdapter {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(format!("Matrix API error {status}: {body}").into());
             }
+
+            // Parse response to get event_id
+            let resp_body: serde_json::Value = resp.json().await?;
+            last_event_id = resp_body["event_id"].as_str().unwrap_or("").to_string();
         }
 
-        Ok(())
+        Ok(last_event_id)
     }
 
     /// Send an HTML-formatted message to a Matrix room.
     ///
     /// Matrix supports rich text via `org.matrix.custom.html` format.
     /// The `plain_text` fallback is shown on clients that don't support HTML.
+    /// Returns the event_id of the sent message.
     async fn api_send_html_message(
         &self,
         room_id: &str,
         plain_text: &str,
         html: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let txn_id = uuid::Uuid::new_v4().to_string();
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            self.homeserver_url, room_id, txn_id
-        );
-
+    ) -> Result<String, Box<dyn std::error::Error>> {
         // Generate plain text fallback by stripping HTML tags
         let fallback = if plain_text.is_empty() {
             strip_html_tags(html)
@@ -121,28 +142,31 @@ impl MatrixAdapter {
             plain_text.to_string()
         };
 
+        // Check if the message fits in a single chunk
         let chunks = crate::types::split_message(&fallback, MAX_MESSAGE_LEN);
-        let html_chunks: Vec<&str> = if html.len() > MAX_MESSAGE_LEN * 2 {
-            // For very long HTML, just send the plain text
-            vec![]
-        } else {
-            vec![html]
-        };
+        let mut last_event_id = String::new();
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let body = if i == 0 && !html_chunks.is_empty() {
-                serde_json::json!({
-                    "msgtype": "m.text",
-                    "body": chunk,
-                    "format": "org.matrix.custom.html",
-                    "formatted_body": html,
-                })
-            } else {
-                serde_json::json!({
-                    "msgtype": "m.text",
-                    "body": chunk,
-                })
-            };
+        if chunks.len() == 1 && html.len() <= MAX_MESSAGE_LEN * 2 {
+            // Single message with HTML formatting
+            let txn_id = uuid::Uuid::new_v4().to_string();
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                self.homeserver_url, room_id, txn_id
+            );
+
+            debug!(
+                "Matrix: sending HTML message to room {}, html_len={}, plain_len={}",
+                room_id,
+                html.len(),
+                fallback.len()
+            );
+
+            let body = serde_json::json!({
+                "msgtype": "m.text",
+                "body": fallback,
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+            });
 
             let resp = self
                 .client
@@ -157,9 +181,121 @@ impl MatrixAdapter {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(format!("Matrix API error {status}: {body}").into());
             }
+
+            // Parse response to get event_id
+            let resp_body: serde_json::Value = resp.json().await?;
+            last_event_id = resp_body["event_id"].as_str().unwrap_or("").to_string();
+        } else {
+            // Message needs chunking - send as plain text without HTML
+            // (splitting HTML would break the structure)
+            warn!(
+                "Matrix: message too long, sending as plain text ({} chunks, html_len={})",
+                chunks.len(),
+                html.len()
+            );
+
+            for chunk in chunks {
+                // Each chunk needs a unique transaction ID
+                let txn_id = uuid::Uuid::new_v4().to_string();
+                let url = format!(
+                    "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                    self.homeserver_url, room_id, txn_id
+                );
+
+                let body = serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": chunk,
+                });
+
+                let resp = self
+                    .client
+                    .put(&url)
+                    .bearer_auth(&*self.access_token)
+                    .json(&body)
+                    .send()
+                    .await?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("Matrix API error {status}: {body}").into());
+                }
+
+                // Parse response to get event_id
+                let resp_body: serde_json::Value = resp.json().await?;
+                last_event_id = resp_body["event_id"].as_str().unwrap_or("").to_string();
+            }
         }
 
-        Ok(())
+        Ok(last_event_id)
+    }
+
+    /// Edit an existing message using Matrix's m.replace relation.
+    ///
+    /// Returns the new event ID on success.
+    async fn api_edit_message(
+        &self,
+        room_id: &str,
+        original_event_id: &str,
+        new_content: &str,
+        new_html: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver_url, room_id, txn_id
+        );
+
+        let plain = strip_html_tags(new_content);
+        let body = if let Some(html) = new_html {
+            serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("* {}", plain),
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": plain,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": original_event_id
+                }
+            })
+        } else {
+            serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("* {}", new_content),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": new_content
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": original_event_id
+                }
+            })
+        };
+
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&*self.access_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(format!("Matrix edit API error {status}: {resp_body}").into());
+        }
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        let event_id = resp_body["event_id"].as_str().unwrap_or("").to_string();
+        Ok(event_id)
     }
 
     /// Validate credentials by calling /whoami.
@@ -477,12 +613,40 @@ impl ChannelAdapter for MatrixAdapter {
         match content {
             ChannelContent::Text(text) => {
                 // Detect if the text contains HTML tags (sent from bridge with MatrixHtml format)
-                if contains_html_tags(&text) {
+                let has_html = contains_html_tags(&text);
+                debug!(
+                    "Matrix send: room={}, text_len={}, has_html={}",
+                    user.platform_id,
+                    text.len(),
+                    has_html
+                );
+
+                if has_html {
+                    debug!("Matrix send: detected HTML tags, sending as formatted message");
+                    // Log first 300 chars of HTML for debugging (use char-level to avoid UTF-8 panic)
+                    let preview = if text.chars().count() > 300 {
+                        format!("{}...", text.chars().take(300).collect::<String>())
+                    } else {
+                        text.clone()
+                    };
+                    debug!("Matrix send: HTML content preview: {}", preview);
+
                     // Extract plain text fallback by stripping tags
                     let plain = strip_html_tags(&text);
+                    debug!("Matrix send: plain text fallback len={}", plain.len());
                     self.api_send_html_message(&user.platform_id, &plain, &text)
                         .await?;
                 } else {
+                    debug!("Matrix send: no HTML tags detected, sending as plain text");
+                    // Log why no HTML was detected - check for common patterns
+                    let has_stars = text.contains("**");
+                    let has_backticks = text.contains('`');
+                    debug!(
+                        "Matrix send: text analysis - has_stars={}, has_backticks={}, first 100 chars: {}",
+                        has_stars,
+                        has_backticks,
+                        if text.chars().count() > 100 { text.chars().take(100).collect::<String>() } else { text.clone() }
+                    );
                     self.api_send_message(&user.platform_id, &text).await?;
                 }
             }
@@ -560,6 +724,155 @@ impl ChannelAdapter for MatrixAdapter {
         let _ = self.shutdown_tx.send(true);
         Ok(())
     }
+
+    /// Send a streaming response using Matrix's edit API for real-time updates.
+    ///
+    /// Tool calls are shown FIRST (before content), using HTML formatting.
+    /// Input/output limited to 3 lines max.
+    async fn send_streaming(
+        &self,
+        user: &ChannelUser,
+        mut rx: mpsc::Receiver<StreamEvent>,
+        output_format: OutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut accumulated = String::new();
+        let mut last_event_id: Option<String> = None;
+        let mut last_edit_len = 0;
+        let mut last_edit_time = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(std::time::Instant::now);
+
+        // Track tool calls: (name, input_preview, output_preview, is_loading, is_error)
+        let mut tool_calls: Vec<ToolCallInfo> = Vec::new();
+        let mut current_tool_input: Option<String> = None;
+
+        // Helper to build full message: tools FIRST, then content
+        let build_message = |tools: &[ToolCallInfo], content: &str, fmt: OutputFormat| -> (String, String) {
+            let content_html = formatter::format_for_channel(content, fmt);
+            let tool_html = format_tool_calls_html(tools);
+            let html = format!("{}{}", tool_html, content_html);
+            let plain = format!("{}{}", strip_html_tags(&tool_html), strip_html_tags(&content_html));
+            (html, plain)
+        };
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::TextDelta { text } => {
+                    accumulated.push_str(&text);
+
+                    let now = std::time::Instant::now();
+                    let chars_since_last = accumulated.chars().count().saturating_sub(last_edit_len);
+                    let time_ok = now.duration_since(last_edit_time).as_millis() > EDIT_INTERVAL_MS as u128;
+                    let content_ok = chars_since_last >= MIN_EDIT_CHARS;
+
+                    if time_ok && content_ok {
+                        let (html, plain) = build_message(&tool_calls, &accumulated, output_format);
+
+                        if let Some(ref event_id) = last_event_id {
+                            debug!("Matrix streaming: editing message, len={}", html.len());
+                            let _ = self.api_edit_message(&user.platform_id, event_id, &plain, Some(&html)).await;
+                        } else {
+                            match self.api_send_html_message(&user.platform_id, &html, &plain).await {
+                                Ok(event_id) => {
+                                    if !event_id.is_empty() {
+                                        last_event_id = Some(event_id);
+                                    }
+                                }
+                                Err(e) => warn!("Matrix streaming: failed to send message: {e}"),
+                            }
+                        }
+
+                        last_edit_len = accumulated.chars().count();
+                        last_edit_time = now;
+                    }
+                }
+
+                StreamEvent::ToolUseStart { name, .. } => {
+                    tool_calls.push((name.clone(), None, None, true, false));
+                    current_tool_input = Some(String::new());
+                    debug!("Matrix streaming: tool start - {}", name);
+
+                    let (html, plain) = build_message(&tool_calls, &accumulated, output_format);
+                    if let Some(ref event_id) = last_event_id {
+                        let _ = self.api_edit_message(&user.platform_id, event_id, &plain, Some(&html)).await;
+                    } else {
+                        match self.api_send_html_message(&user.platform_id, &html, &plain).await {
+                            Ok(event_id) => {
+                                if !event_id.is_empty() {
+                                    last_event_id = Some(event_id);
+                                }
+                            }
+                            Err(e) => warn!("Matrix streaming: failed to send: {e}"),
+                        }
+                    }
+                }
+
+                StreamEvent::ToolInputDelta { text } => {
+                    if let Some(ref mut input) = current_tool_input {
+                        input.push_str(&text);
+                    }
+                }
+
+                StreamEvent::ToolUseEnd { name, input, .. } => {
+                    for tool in &mut tool_calls {
+                        if tool.0 == name && tool.3 {
+                            let input_preview = if let Ok(json) = serde_json::to_string(&input) {
+                                if json == "null" || json.is_empty() {
+                                    let fallback = input.to_string();
+                                    if fallback.is_empty() { NO_PARAMS.to_string() } else { fallback }
+                                } else {
+                                    json
+                                }
+                            } else {
+                                let fallback = input.to_string();
+                                if fallback.is_empty() { NO_PARAMS.to_string() } else { fallback }
+                            };
+                            tool.1 = Some(input_preview);
+                            break;
+                        }
+                    }
+                    current_tool_input = None;
+                }
+
+                StreamEvent::ToolExecutionResult { name, result_preview, is_error } => {
+                    for tool in &mut tool_calls {
+                        if tool.0 == name && tool.3 {
+                            tool.2 = Some(result_preview.clone());
+                            tool.3 = false;
+                            tool.4 = is_error;
+                            break;
+                        }
+                    }
+                    debug!("Matrix streaming: tool result - {} (error={})", name, is_error);
+
+                    let (html, plain) = build_message(&tool_calls, &accumulated, output_format);
+                    if let Some(ref event_id) = last_event_id {
+                        let _ = self.api_edit_message(&user.platform_id, event_id, &plain, Some(&html)).await;
+                    }
+                }
+
+                StreamEvent::ContentComplete { .. } => {
+                    let (html, plain) = build_message(&tool_calls, &accumulated, output_format);
+
+                    if let Some(ref event_id) = last_event_id {
+                        debug!("Matrix streaming: final edit, len={}", html.len());
+                        self.api_edit_message(&user.platform_id, event_id, &plain, Some(&html)).await?;
+                    } else {
+                        debug!("Matrix streaming: sending as new message");
+                        self.api_send_html_message(&user.platform_id, &html, &plain).await?;
+                    }
+                }
+
+                StreamEvent::PhaseChange { phase, detail } => {
+                    debug!("Matrix streaming: phase change to {} ({:?})", phase, detail);
+                }
+
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Check if text contains HTML tags that should be sent as formatted Matrix message.
@@ -620,6 +933,126 @@ fn strip_html_tags(html: &str) -> String {
     }
 
     collapsed.trim().to_string()
+}
+
+/// Get icon for a tool based on its name.
+fn tool_icon(name: &str) -> &'static str {
+    match name {
+        "web_search" | "web_fetch" => "🌐",
+        "read_file" | "glob" | "grep" | "search_file_content" => "📄",
+        "write_file" | "replace" => "✏️",
+        "run_shell_command" | "bash" => "💻",
+        "image_generate" | "image_read" => "🖼️",
+        "web_search_planning" => "🔍",
+        "list_directory" => "📁",
+        "todo_write" | "todo_read" => "📋",
+        "ask_user_question" => "❓",
+        _ => "🔧",
+    }
+}
+
+/// Truncate text to max lines and max characters.
+fn truncate_text(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut result = String::new();
+    let mut char_count = 0;
+
+    for line in text.lines().take(max_lines) {
+        if char_count >= max_chars {
+            break;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+            char_count += 1;
+        }
+        let remaining = max_chars.saturating_sub(char_count);
+        if line.chars().count() > remaining {
+            let truncated: String = line.chars().take(remaining).collect();
+            result.push_str(&truncated);
+            char_count = max_chars;
+            break;
+        } else {
+            result.push_str(line);
+            char_count += line.chars().count();
+        }
+    }
+
+    let needs_ellipsis = text.lines().count() > max_lines
+        || text.chars().count() > max_chars
+        || char_count >= max_chars;
+
+    if needs_ellipsis {
+        format!("{}...", result)
+    } else {
+        result
+    }
+}
+
+/// Escape HTML special characters.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Tool call info for formatting.
+type ToolCallInfo = (String, Option<String>, Option<String>, bool, bool);
+
+/// Format completed tool calls as HTML.
+fn format_tool_calls_html(tools: &[ToolCallInfo]) -> String {
+    let completed_tools: Vec<_> = tools.iter()
+        .filter(|(_, _, output, _, _)| output.is_some())
+        .collect();
+
+    if completed_tools.is_empty() {
+        return String::new();
+    }
+
+    let mut html = String::new();
+    let count = completed_tools.len();
+
+    // Header
+    html.push_str(&format!("<b>{} ({})</b><br/>", TOOL_CALLS_HEADER, count));
+
+    for (idx, (name, input, output, _is_loading, is_error)) in completed_tools.iter().enumerate() {
+        let icon = tool_icon(name);
+
+        // Wrap entire tool in blockquote for indentation
+        html.push_str("<blockquote>");
+        html.push_str(&format!("{}. {} <b>{}</b>", idx + 1, icon, name));
+
+        // Input section
+        if let Some(ref inp) = input {
+            let truncated = truncate_text(inp, MAX_PREVIEW_LINES, MAX_INPUT_CHARS);
+            let indented = truncated.lines()
+                .map(|line| format!("{}{}", INDENT_PREFIX, escape_html(line)))
+                .collect::<Vec<_>>()
+                .join("<br/>");
+            html.push_str(&format!(
+                "<br/><br/><blockquote>{}<br/><code>{}</code></blockquote>",
+                INPUT_LABEL, indented
+            ));
+        }
+
+        // Output section
+        if let Some(ref out) = output {
+            let truncated = truncate_text(out, MAX_PREVIEW_LINES, MAX_OUTPUT_CHARS);
+            let status_icon = if *is_error { ERROR_LABEL } else { "" };
+            let label = if *is_error { ERROR_LABEL } else { OUTPUT_LABEL };
+            let indented = truncated.lines()
+                .map(|line| format!("{}{}", INDENT_PREFIX, escape_html(line)))
+                .collect::<Vec<_>>()
+                .join("<br/>");
+            html.push_str(&format!(
+                "<blockquote>{} {}<br/><code>{}</code></blockquote>",
+                status_icon, label, indented
+            ));
+        }
+
+        html.push_str("</blockquote>");
+    }
+
+    html.push_str("<br/>");
+    html
 }
 
 #[cfg(test)]

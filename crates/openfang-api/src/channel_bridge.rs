@@ -980,6 +980,22 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
         msg
     }
+
+    // ── Streaming support ──
+
+    async fn send_message_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<openfang_runtime::llm_driver::StreamEvent>, String>
+    {
+        use openfang_runtime::kernel_handle::KernelHandle;
+        let handle: Arc<dyn KernelHandle> = self.kernel.clone();
+        self.kernel
+            .send_message_streaming(agent_id, message, Some(handle), None, None)
+            .map(|(rx, _)| rx)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Parse a trigger pattern string from chat into a `TriggerPattern`.

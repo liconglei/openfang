@@ -224,6 +224,24 @@ pub trait ChannelBridgeHandle: Send + Sync {
     async fn a2a_agents_text(&self) -> String {
         "A2A agents not available.".to_string()
     }
+
+    // ── Streaming support ──
+
+    /// Send a message with streaming response.
+    ///
+    /// Returns a receiver for StreamEvent on success, or an error message if
+    /// streaming is not supported. Default implementation returns an error.
+    ///
+    /// This is optional — channels that don't support streaming can rely on
+    /// the default `send_message` method.
+    async fn send_message_streaming(
+        &self,
+        _agent_id: AgentId,
+        _message: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<openfang_runtime::llm_driver::StreamEvent>, String>
+    {
+        Err("Streaming not supported by this kernel".to_string())
+    }
 }
 
 /// Per-channel rate limiter tracking message timestamps per user.
@@ -412,6 +430,7 @@ async fn send_response(
     } else {
         formatter::format_for_channel(&text, output_format)
     };
+
     let content = ChannelContent::Text(formatted);
 
     let result = if let Some(tid) = thread_id {
@@ -891,6 +910,73 @@ async fn dispatch_message(
     // (which expire typing after ~5s) keep showing it during long LLM calls.
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
+    // Try streaming first (if supported by kernel and adapter)
+    // This provides real-time updates for channels like Matrix
+    let streaming_result = handle.send_message_streaming(agent_id, &text).await;
+    let use_streaming = streaming_result.is_ok();
+
+    if use_streaming {
+        // Streaming path - adapter handles real-time updates
+        let rx = streaming_result.unwrap();
+        let result = adapter_arc
+            .send_streaming(&message.sender, rx, output_format)
+            .await;
+
+        typing_task.abort();
+
+        // Convert result to avoid Send trait issues with Box<dyn Error>
+        let result = result.map_err(|e| e.to_string());
+
+        match result {
+            Ok(()) => {
+                if lifecycle_reactions {
+                    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done)
+                        .await;
+                }
+                handle
+                    .record_delivery(
+                        agent_id,
+                        ct_str,
+                        &message.sender.platform_id,
+                        true,
+                        None,
+                        thread_id,
+                    )
+                    .await;
+            }
+            Err(err_str) => {
+                if lifecycle_reactions {
+                    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error)
+                        .await;
+                }
+                warn!("Streaming send failed for {agent_id}: {err_str}");
+                let err_msg = sanitize_agent_error(&err_str);
+                if !adapter.suppress_error_responses() {
+                    send_response(
+                        adapter,
+                        &message.sender,
+                        err_msg.clone(),
+                        thread_id,
+                        output_format,
+                    )
+                    .await;
+                }
+                handle
+                    .record_delivery(
+                        agent_id,
+                        ct_str,
+                        &message.sender.platform_id,
+                        false,
+                        Some(&err_msg),
+                        thread_id,
+                    )
+                    .await;
+            }
+        }
+        return;
+    }
+
+    // Non-streaming path (fallback or when streaming not supported)
     // Send to agent and relay response
     let result = handle.send_message(agent_id, &text).await;
 

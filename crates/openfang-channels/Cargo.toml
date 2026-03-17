@@ -7,6 +7,7 @@ description = "Channel Bridge Layer — pluggable messaging integrations for Ope
 
 [dependencies]
 openfang-types = { path = "../openfang-types" }
+openfang-runtime = { path = "../openfang-runtime" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,6 +33,7 @@ hex = { workspace = true }
 html-escape = { workspace = true }
 regex-lite = "0.1"
 roxmltree = "0.20"
+pulldown-cmark = "0.13"
 
 lettre = { workspace = true }
 imap = { workspace = true }

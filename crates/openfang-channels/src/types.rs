@@ -277,6 +277,34 @@ pub trait ChannelAdapter: Send + Sync {
     fn suppress_error_responses(&self) -> bool {
         false
     }
+
+    /// Send a streaming response back to a user on this channel.
+    ///
+    /// Default implementation accumulates all text deltas and sends once.
+    /// Adapters that support real-time updates (e.g. Matrix edit API)
+    /// can override this for live streaming.
+    ///
+    /// This is optional — channels that don't support streaming can rely on
+    /// the default behavior.
+    async fn send_streaming(
+        &self,
+        user: &ChannelUser,
+        rx: tokio::sync::mpsc::Receiver<openfang_runtime::llm_driver::StreamEvent>,
+        _output_format: OutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use openfang_runtime::llm_driver::StreamEvent;
+        let mut accumulated = String::new();
+        let mut rx = rx;
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta { text } = event {
+                accumulated.push_str(&text);
+            }
+        }
+        if !accumulated.is_empty() {
+            self.send(user, ChannelContent::Text(accumulated)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Split a message into chunks of at most `max_len` characters,
