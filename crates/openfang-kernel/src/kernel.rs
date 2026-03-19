@@ -6179,6 +6179,16 @@ impl KernelHandle for OpenFangKernel {
                 .and_then(|c| c.overrides.output_format)
                 .unwrap_or(OutputFormat::PlainText);
             openfang_channels::formatter::format_for_wecom(message, output_format)
+        } else if channel == "matrix" {
+            // Matrix needs HTML formatting for proper rendering
+            let output_format = self
+                .config
+                .channels
+                .matrix
+                .as_ref()
+                .and_then(|c| c.overrides.output_format)
+                .unwrap_or(OutputFormat::MatrixHtml);
+            openfang_channels::formatter::format_for_channel(message, output_format)
         } else {
             message.to_string()
         };

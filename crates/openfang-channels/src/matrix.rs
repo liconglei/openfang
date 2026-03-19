@@ -397,6 +397,33 @@ async fn initial_sync(
     body["next_batch"].as_str().map(String::from)
 }
 
+/// Convert a Matrix mxc:// URL to a download URL.
+///
+/// Matrix media URLs are in the format: mxc://serverName/mediaId
+/// Download URL format: {homeserver}/_matrix/media/v3/download/{serverName}/{mediaId}
+fn mxc_to_download_url(homeserver: &str, mxc_url: &str) -> Option<String> {
+    if !mxc_url.starts_with("mxc://") {
+        return None;
+    }
+    // Remove "mxc://" prefix
+    let rest = &mxc_url[6..];
+    // Split into serverName and mediaId
+    let parts: Vec<&str> = rest.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let server_name = parts[0];
+    let media_id = parts[1];
+    
+    // Build download URL
+    // Remove trailing slash from homeserver if present
+    let homeserver = homeserver.trim_end_matches('/');
+    Some(format!(
+        "{}/_matrix/media/v3/download/{}/{}",
+        homeserver, server_name, media_id
+    ))
+}
+
 #[async_trait]
 impl ChannelAdapter for MatrixAdapter {
     fn name(&self) -> &str {
@@ -525,27 +552,81 @@ impl ChannelAdapter for MatrixAdapter {
                                     continue; // Skip own messages
                                 }
 
-                                let content = event["content"]["body"].as_str().unwrap_or("");
-                                if content.is_empty() {
-                                    continue;
-                                }
+                                // Check msgtype to handle different message types
+                                let msgtype = event["content"]["msgtype"].as_str().unwrap_or("m.text");
+                                let body = event["content"]["body"].as_str().unwrap_or("");
 
-                                let msg_content = if content.starts_with('/') {
-                                    let parts: Vec<&str> = content.splitn(2, ' ').collect();
-                                    let cmd = parts[0].trim_start_matches('/');
-                                    let args: Vec<String> = parts
-                                        .get(1)
-                                        .map(|a| a.split_whitespace().map(String::from).collect())
-                                        .unwrap_or_default();
-                                    ChannelContent::Command {
-                                        name: cmd.to_string(),
-                                        args,
+                                let msg_content = match msgtype {
+                                    "m.image" => {
+                                        // Matrix image message: extract mxc:// URL and convert to download URL
+                                        let mxc_url = event["content"]["url"].as_str().unwrap_or("");
+                                        if let Some(download_url) = mxc_to_download_url(&homeserver, mxc_url) {
+                                            let caption = if body.is_empty() { None } else { Some(body.to_string()) };
+                                            ChannelContent::Image { url: download_url, caption }
+                                        } else {
+                                            ChannelContent::Text(format!("[Image: {}]", body))
+                                        }
                                     }
-                                } else {
-                                    ChannelContent::Text(content.to_string())
+                                    "m.file" => {
+                                        // Matrix file message
+                                        let mxc_url = event["content"]["url"].as_str().unwrap_or("");
+                                        let filename = event["content"]["filename"]
+                                            .as_str()
+                                            .or(Some(body))
+                                            .unwrap_or("file")
+                                            .to_string();
+                                        if let Some(download_url) = mxc_to_download_url(&homeserver, mxc_url) {
+                                            ChannelContent::File { url: download_url, filename }
+                                        } else {
+                                            ChannelContent::Text(format!("[File: {}]", filename))
+                                        }
+                                    }
+                                    "m.video" => {
+                                        // Matrix video message - treat as file
+                                        let mxc_url = event["content"]["url"].as_str().unwrap_or("");
+                                        let filename = if body.is_empty() { "video".to_string() } else { body.to_string() };
+                                        if let Some(download_url) = mxc_to_download_url(&homeserver, mxc_url) {
+                                            ChannelContent::File { url: download_url, filename }
+                                        } else {
+                                            ChannelContent::Text(format!("[Video: {}]", filename))
+                                        }
+                                    }
+                                    "m.audio" => {
+                                        // Matrix audio message - treat as file
+                                        let mxc_url = event["content"]["url"].as_str().unwrap_or("");
+                                        let filename = if body.is_empty() { "audio".to_string() } else { body.to_string() };
+                                        if let Some(download_url) = mxc_to_download_url(&homeserver, mxc_url) {
+                                            ChannelContent::File { url: download_url, filename }
+                                        } else {
+                                            ChannelContent::Text(format!("[Audio: {}]", filename))
+                                        }
+                                    }
+                                    _ => {
+                                        // Default: m.text or unknown - handle as text
+                                        if body.is_empty() {
+                                            continue;
+                                        }
+                                        if body.starts_with('/') {
+                                            let parts: Vec<&str> = body.splitn(2, ' ').collect();
+                                            let cmd = parts[0].trim_start_matches('/');
+                                            let args: Vec<String> = parts
+                                                .get(1)
+                                                .map(|a| a.split_whitespace().map(String::from).collect())
+                                                .unwrap_or_default();
+                                            ChannelContent::Command {
+                                                name: cmd.to_string(),
+                                                args,
+                                            }
+                                        } else {
+                                            ChannelContent::Text(body.to_string())
+                                        }
+                                    }
                                 };
 
                                 let event_id = event["event_id"].as_str().unwrap_or("").to_string();
+
+                                // Use body for mention detection
+                                let content = body;
 
                                 // FIX #2: Detect @mentions in message text.
                                 let mut metadata = HashMap::new();
