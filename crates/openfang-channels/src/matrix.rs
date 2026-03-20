@@ -934,6 +934,15 @@ impl ChannelAdapter for MatrixAdapter {
                 }
 
                 StreamEvent::ContentComplete { .. } => {
+                    // Skip sending empty messages - this happens when LLM returns empty response
+                    let has_content = !accumulated.trim().is_empty();
+                    let has_tools = !tool_calls.is_empty();
+
+                    if !has_content && !has_tools {
+                        debug!("Matrix streaming: skipping empty message");
+                        return Ok(());
+                    }
+
                     let (html, plain) = build_message(&tool_calls, &accumulated, output_format);
 
                     if let Some(ref event_id) = last_event_id {
