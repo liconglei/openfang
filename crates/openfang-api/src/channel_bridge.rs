@@ -1235,6 +1235,7 @@ pub async fn start_channel_bridge_with_config(
                 mx_config.user_id.clone(),
                 token,
                 mx_config.allowed_rooms.clone(),
+                mx_config.auto_accept_invites,
             ));
             adapters.push((adapter, mx_config.default_agent.clone()));
         }

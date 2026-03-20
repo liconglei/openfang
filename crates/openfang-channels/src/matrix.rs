@@ -64,6 +64,7 @@ impl MatrixAdapter {
         user_id: String,
         access_token: String,
         allowed_rooms: Vec<String>,
+        auto_accept_invites: bool,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -75,7 +76,7 @@ impl MatrixAdapter {
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             since_token: Arc::new(RwLock::new(None)),
-            auto_accept_invites: true,
+            auto_accept_invites,
         }
     }
 
@@ -1147,6 +1148,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "access_token".to_string(),
             vec![],
+            false,
         );
         assert_eq!(adapter.name(), "matrix");
     }
@@ -1158,6 +1160,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "token".to_string(),
             vec!["!room1:matrix.org".to_string()],
+            false,
         );
         assert!(adapter.is_allowed_room("!room1:matrix.org"));
         assert!(!adapter.is_allowed_room("!room2:matrix.org"));
@@ -1167,6 +1170,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "token".to_string(),
             vec![],
+            false,
         );
         assert!(open.is_allowed_room("!any:matrix.org"));
     }
