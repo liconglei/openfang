@@ -992,7 +992,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         use openfang_runtime::kernel_handle::KernelHandle;
         let handle: Arc<dyn KernelHandle> = self.kernel.clone();
         self.kernel
-            .send_message_streaming(agent_id, message, Some(handle), None, None)
+            .send_message_streaming(agent_id, message, Some(handle), None, None, None)
             .map(|(rx, _)| rx)
             .map_err(|e| e.to_string())
     }

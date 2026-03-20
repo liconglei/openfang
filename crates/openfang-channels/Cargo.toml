@@ -33,6 +33,7 @@ hex = { workspace = true }
 html-escape = { workspace = true }
 regex-lite = "0.1"
 roxmltree = "0.21"
+pulldown-cmark = "0.13"
 
 lettre = { workspace = true }
 imap = { workspace = true }
